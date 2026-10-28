@@ -3254,6 +3254,68 @@ fn decode_block_type_and_length_slice<AllocHC: alloc::Allocator<HuffmanCode>>(
   status
 }
 
+#[derive(Clone, Copy)]
+enum LiteralBatchStatus {
+  Decoded,
+  NotHandled,
+  CorruptInput,
+}
+
+#[inline(always)]
+fn decode_literal_batch<'b>(
+  rb: &mut [u8],
+  pos: usize,
+  count: usize,
+  trivial_literal_context: i32,
+  literal_htree: &HuffmanTable,
+  context_trees: &[&HuffmanTable; 64],
+  context_lookup: &[u8; 512],
+  mut fbr: bit_reader::BitReaderSlice<'b>,
+) -> (bit_reader::BitReaderSlice<'b>, LiteralBatchStatus) {
+  if trivial_literal_context != 0 {
+    let ring_window = match rb.get_mut(pos..).and_then(|w| w.get_mut(..count)) {
+      Some(w) => w,
+      None => return (fbr, LiteralBatchStatus::NotHandled),
+    };
+    for dst in ring_window.iter_mut() {
+      if !fbr.fill16_checked() {
+        mark_unlikely();
+        return (fbr, LiteralBatchStatus::CorruptInput);
+      }
+      *dst = decode_symbol_no_fill(&mut fbr, literal_htree) as u8;
+    }
+    (fbr, LiteralBatchStatus::Decoded)
+  } else {
+    let start = pos.wrapping_sub(2);
+    let len = count + 2;
+    let Some([p2_init, p1_init, ref mut ring_window @ ..]) =
+      rb.get_mut(start..).and_then(|w| w.get_mut(..len))
+    else {
+      return (fbr, LiteralBatchStatus::NotHandled);
+    };
+    let Some((lut0, rest)) = context_lookup.split_first_chunk::<256>() else {
+      return (fbr, LiteralBatchStatus::NotHandled);
+    };
+    let Some((lut1, _)) = rest.split_first_chunk::<256>() else {
+      return (fbr, LiteralBatchStatus::NotHandled);
+    };
+    let mut p1: u8 = *p1_init;
+    let mut p2: u8 = *p2_init;
+    for dst in ring_window.iter_mut() {
+      if !fbr.fill16_checked() {
+        mark_unlikely();
+        return (fbr, LiteralBatchStatus::CorruptInput);
+      }
+      let context = (lut0[p1 as usize] | lut1[p2 as usize]) as usize;
+      let hc = context_trees[context & 63];
+      p2 = p1;
+      p1 = decode_symbol_no_fill(&mut fbr, hc) as u8;
+      *dst = p1;
+    }
+    (fbr, LiteralBatchStatus::Decoded)
+  }
+}
+
 // Executes a compound, custom shared, or static dictionary reference when
 // `distance_code > max_distance`. Returns `Ok((new_pos, post_write_1))`.
 #[inline(always)]
@@ -3608,6 +3670,41 @@ fn ProcessCommandsInternal<
 
     if (!SAFE && i != 0) || (SAFE && matches!(state, BrotliRunningState::BROTLI_STATE_COMMAND_INNER)) {
       'inner: loop {
+        if !SAFE {
+          let i_u32 = i as u32;
+          let block_len = s.block_type_length_state.block_length[0];
+          let mut handled = false;
+          if i > 0 && i_u32 <= block_len && pos < rb_size - i && i_u32 * 2 + 34 <= fbr.avail_in() {
+            let (next_fbr, status) = decode_literal_batch(
+              rb,
+              pos as usize,
+              i as usize,
+              s.trivial_literal_context,
+              literal_htree,
+              &context_trees,
+              s.context_lookup,
+              fbr,
+            );
+            fbr = next_fbr;
+            match status {
+              LiteralBatchStatus::Decoded => {
+                pos += i;
+                s.block_type_length_state.block_length[0] = block_len - i_u32;
+                handled = true;
+              }
+              LiteralBatchStatus::NotHandled => {}
+              LiteralBatchStatus::CorruptInput => {
+                result = BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_UNREACHABLE;
+                break 'cmd;
+              }
+            }
+          }
+          if handled {
+            break 'inner;
+          }
+          mark_unlikely();
+        }
+
         let mut p1: u8 = if !SAFE {
           rb[(pos.wrapping_sub(1) as usize) & rb_mask_usize]
         } else if rb.is_empty() {
@@ -3622,56 +3719,6 @@ fn ProcessCommandsInternal<
         } else {
           fast!((rb)[((pos - 2) & rb_mask) as usize])
         };
-        if !SAFE && i > 0 {
-          let blk_len = s.block_type_length_state.block_length[0];
-          let rem_rb = rb_size - 1 - pos;
-          let rem_in = (fbr.rem.len().saturating_sub(36) >> 1) as u32;
-          if pos >= 0 && rem_rb > 0 {
-            let fast_steps = (i as u32)
-              .min(blk_len)
-              .min(rem_rb as u32)
-              .min(rem_in) as usize;
-            if fast_steps > 0 {
-              if s.trivial_literal_context != 0 {
-                if let Some(out_slice) = rb.get_mut(pos as usize..pos as usize + fast_steps) {
-                  for out_byte in out_slice.iter_mut() {
-                    p2 = p1;
-                    p1 = read_symbol_slice(&mut fbr, literal_htree) as u8;
-                    *out_byte = p1;
-                  }
-                  pos += fast_steps as i32;
-                  s.block_type_length_state.block_length[0] = blk_len - fast_steps as u32;
-                  i -= fast_steps as i32;
-                  if i == 0 {
-                    break 'inner;
-                  }
-                }
-              } else {
-                let context_lookup = s.context_lookup;
-                if let (Ok(lut0), Ok(lut1)) = (
-                  <&[u8; 256] as core::convert::TryFrom<&[u8]>>::try_from(&context_lookup[..256]),
-                  <&[u8; 256] as core::convert::TryFrom<&[u8]>>::try_from(&context_lookup[256..]),
-                ) {
-                  if let Some(out_slice) = rb.get_mut(pos as usize..pos as usize + fast_steps) {
-                    for out_byte in out_slice.iter_mut() {
-                      let context = lut0[p1 as usize] | lut1[p2 as usize];
-                      let hc = context_trees[context as usize & 63];
-                      p2 = p1;
-                      p1 = read_symbol_slice(&mut fbr, hc) as u8;
-                      *out_byte = p1;
-                    }
-                    pos += fast_steps as i32;
-                    s.block_type_length_state.block_length[0] = blk_len - fast_steps as u32;
-                    i -= fast_steps as i32;
-                    if i == 0 {
-                      break 'inner;
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
         loop {
           if !SAFE && !fbr.has_input() {
             exit_state = BrotliRunningState::BROTLI_STATE_COMMAND_INNER;
@@ -4015,6 +4062,134 @@ fn ProcessCommandsInternal<
   result
 }
 
+#[cold]
+#[inline(never)]
+fn ResumePartialCommand<AllocU8: alloc::Allocator<u8>,
+                        AllocU32: alloc::Allocator<u32>,
+                        AllocHC: alloc::Allocator<HuffmanCode>>
+  (s: &mut BrotliState<AllocU8, AllocU32, AllocHC>,
+   input: &[u8],
+   dictionary: &[u8])
+   -> BrotliDecoderErrorCode {
+  // When streaming input chunks (e.g. 32 KiB) or ringbuffer flushes (`pos == 0`)
+  // split a long literal insert run, batch-decode remaining literals with
+  // BitReaderSlice before delegating the command tail to ProcessCommandsInternal::<true>.
+  while matches!(s.state, BrotliRunningState::BROTLI_STATE_COMMAND_INNER) && s.loop_counter > 0 {
+    let rb_size = s.ringbuffer_size;
+    let rb_mask = s.ringbuffer_mask;
+    let pos = s.pos;
+    if rb_size < 2 || (rb_size & (rb_size - 1)) != 0 || rb_mask != rb_size - 1 || pos < 0 || pos >= rb_size {
+      break;
+    }
+    let Some(mut fbr) = bit_reader::BitReaderSlice::new(&s.br, input) else {
+      break;
+    };
+    if !fbr.has_input() {
+      break;
+    }
+    if s.block_type_length_state.block_length[0] == 0 {
+      let status = decode_block_type_and_length_slice(&mut s.block_type_length_state, &mut fbr, 0);
+      fbr.sync_to(&mut s.br);
+      if !matches!(status, BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS) {
+        return status;
+      }
+      PrepareLiteralDecoding(s);
+      if s.block_type_length_state.block_length[0] == 0 {
+        return BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS;
+      }
+      continue;
+    }
+
+    let avail = fbr.avail_in();
+    if avail < 36 {
+      break;
+    }
+    let block_len = s.block_type_length_state.block_length[0];
+    let max_by_in = ((avail - 34) >> 1) as i32;
+    let max_by_rb = rb_size - 1 - pos;
+    let max_by_blk = (block_len.min(i32::MAX as u32)) as i32;
+    let batch = s.loop_counter.min(max_by_in).min(max_by_rb).min(max_by_blk);
+    if batch <= 0 {
+      break;
+    }
+    if s.trivial_literal_context == 0 && pos < 2 {
+      let rb_mask_usize = (rb_mask as usize) & 0x7fff_ffff;
+      let rb = s.ringbuffer.slice_mut();
+      let (Some(&b1), Some(&b2)) = (
+        rb.get((pos.wrapping_sub(1) as usize) & rb_mask_usize),
+        rb.get((pos.wrapping_sub(2) as usize) & rb_mask_usize),
+      ) else {
+        break;
+      };
+      let context = (s.context_lookup[b1 as usize] | s.context_lookup[b2 as usize | 256]) as usize;
+      let tree_idx = s.context_map.slice()[s.context_map_slice_index + (context & 63)] as usize;
+      let lit = read_symbol_slice(&mut fbr, huffman_tree(&s.literal_hgroup, tree_idx)) as u8;
+      rb[pos as usize] = lit;
+      fbr.sync_to(&mut s.br);
+      s.pos = pos + 1;
+      s.loop_counter -= 1;
+      s.block_type_length_state.block_length[0] = block_len - 1;
+      if s.loop_counter == 0 {
+        s.state = if s.meta_block_remaining_len <= 0 {
+          BrotliRunningState::BROTLI_STATE_METABLOCK_DONE
+        } else {
+          BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS
+        };
+        if matches!(s.state, BrotliRunningState::BROTLI_STATE_METABLOCK_DONE) {
+          return BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS;
+        }
+        break;
+      }
+      continue;
+    }
+    let htree = huffman_tree(&s.literal_hgroup, s.literal_htree_index as usize);
+    let mut trees_storage = EMPTY_CONTEXT_TREES;
+    let trees = if s.trivial_literal_context != 0 {
+      &EMPTY_CONTEXT_TREES
+    } else {
+      fill_context_trees(
+        &mut trees_storage,
+        &s.literal_hgroup,
+        s.context_map.slice(),
+        s.context_map_slice_index,
+      );
+      &trees_storage
+    };
+    let rb = s.ringbuffer.slice_mut();
+    let (next_fbr, status) = decode_literal_batch(
+      rb,
+      pos as usize,
+      batch as usize,
+      s.trivial_literal_context,
+      htree,
+      trees,
+      s.context_lookup,
+      fbr,
+    );
+    fbr = next_fbr;
+    match status {
+      LiteralBatchStatus::Decoded => {}
+      LiteralBatchStatus::NotHandled => break,
+      LiteralBatchStatus::CorruptInput => {
+        return BrotliDecoderErrorCode::BROTLI_DECODER_ERROR_UNREACHABLE;
+      }
+    }
+    fbr.sync_to(&mut s.br);
+    s.pos = pos + batch;
+    s.loop_counter -= batch;
+    s.block_type_length_state.block_length[0] = block_len - batch as u32;
+    if s.loop_counter == 0 {
+      if s.meta_block_remaining_len <= 0 {
+        s.state = BrotliRunningState::BROTLI_STATE_METABLOCK_DONE;
+        return BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS;
+      }
+      s.state = BrotliRunningState::BROTLI_STATE_COMMAND_POST_DECODE_LITERALS;
+      break;
+    }
+  }
+  SafeProcessCommandsEntry(true, s, input, dictionary)
+}
+
 // Kept out of line: inlined into BrotliDecompressStream, the command loop would
 // share registers with the whole stream state machine and reload its state
 // from the stack.
@@ -4032,7 +4207,7 @@ fn ProcessCommands<AllocU8: alloc::Allocator<u8>,
   }
   if !matches!(s.state, BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN) {
     mark_unlikely();
-    let status = SafeProcessCommandsEntry(true, s, input, dictionary);
+    let status = ResumePartialCommand(s, input, dictionary);
     if !matches!(status, BrotliDecoderErrorCode::BROTLI_DECODER_SUCCESS)
       || !matches!(s.state, BrotliRunningState::BROTLI_STATE_COMMAND_BEGIN)
     {
