@@ -376,7 +376,7 @@ pub struct BrotliState<AllocU8: alloc::Allocator<u8>,
   pub context_index: u32,
   pub max_run_length_prefix: u32,
   pub code: u32,
-  // always pre-allocated on state creation
+  // Allocated when first needed, by a context map of more than one tree.
   pub context_map_table: AllocHC::AllocatedMemory,
 
   // For InverseMoveToFrontTransform
@@ -921,6 +921,7 @@ impl <'brotli_state,
 
 
 
+#[inline]
 pub fn BrotliDecoderErrorStr(c: BrotliDecoderErrorCode) -> &'static str {
   match c {
   BrotliDecoderErrorCode::BROTLI_DECODER_NO_ERROR => "NO_ERROR\0",

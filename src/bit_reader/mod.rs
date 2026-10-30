@@ -78,6 +78,7 @@ impl Default for BrotliBitReaderState {
   }
 }
 
+#[inline(always)]
 pub fn BrotliBitReaderSaveState(from: &BrotliBitReader) -> BrotliBitReaderState {
   BrotliBitReaderState {
     val_: from.val_,
@@ -87,6 +88,7 @@ pub fn BrotliBitReaderSaveState(from: &BrotliBitReader) -> BrotliBitReaderState 
   }
 }
 
+#[inline(always)]
 pub fn BrotliBitReaderRestoreState(to: &mut BrotliBitReader, from: &BrotliBitReaderState) {
   to.val_ = from.val_;
   to.bit_pos_ = from.bit_pos_;
@@ -109,6 +111,7 @@ pub fn is_valid_input_range(input_offset: usize, available_in: usize, input_len:
   end <= input_len as u64 && end <= u64::from(u32::MAX)
 }
 
+#[inline]
 pub fn is_valid_bit_reader(br: &BrotliBitReader, input: &[u8]) -> bool {
   let register_bits = (::core::mem::size_of::<reg_t>() as u32) << 3;
   br.bit_pos_ <= register_bits &&
@@ -117,6 +120,7 @@ pub fn is_valid_bit_reader(br: &BrotliBitReader, input: &[u8]) -> bool {
 
 // Returns amount of unread bytes the bit reader still has buffered from the
 // BrotliInput, including whole bytes in br->val_.
+#[inline(always)]
 pub fn BrotliGetRemainingBytes(br: &BrotliBitReader) -> u32 {
   br.avail_in + (BrotliGetAvailableBits(br) >> 3)
 }
@@ -177,11 +181,13 @@ pub fn BrotliFillBitWindow(br: &mut BrotliBitReader, n_bits: u32, input: &[u8]) 
 
 // Mostly like BrotliFillBitWindow, but guarantees only 16 bits and reads no
 // more than BROTLI_SHORT_FILL_BIT_WINDOW_READ bytes of input.
+#[inline(always)]
 pub fn BrotliFillBitWindow16(br: &mut BrotliBitReader, input: &[u8]) {
   BrotliFillBitWindow(br, 17, input);
 }
 
 // Pulls one byte of input to accumulator.
+#[inline]
 pub fn BrotliPullByte(br: &mut BrotliBitReader, input: &[u8]) -> bool {
   if br.avail_in == 0 {
     return false;
@@ -223,6 +229,7 @@ pub fn BrotliGetConstantNBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u8
 
 // Tries to peek the specified amount of bits. Returns 0, if there is not
 // enough input.
+#[inline]
 pub fn BrotliSafeGetBits(br: &mut BrotliBitReader,
                          n_bits: u32,
                          val: &mut u32,
@@ -254,6 +261,7 @@ pub fn BrotliBitReaderClearUnclaimed(br: &mut BrotliBitReader) {
   }
 }
 
+#[inline]
 pub fn BrotliBitReaderUnload(br: &mut BrotliBitReader) {
   let unused_bytes: u32 = BrotliGetAvailableBits(br) >> 3;
   br.avail_in += unused_bytes;
@@ -300,6 +308,7 @@ pub fn BrotliReadConstantNBits(br: &mut BrotliBitReader, n_bits: u32, input: &[u
 
 // Tries to read the specified amount of bits. Returns 0, if there is not
 // enough input. n_bits MUST be positive.
+#[inline]
 pub fn BrotliSafeReadBits(br: &mut BrotliBitReader,
                           n_bits: u32,
                           val: &mut u32,
@@ -316,6 +325,7 @@ pub fn BrotliSafeReadBits(br: &mut BrotliBitReader,
 
 // Advances the bit reader position to the next byte boundary and verifies
 // that any skipped bits are set to zero.
+#[inline]
 pub fn BrotliJumpToByteBoundary(br: &mut BrotliBitReader) -> bool {
   let pad_bits_count: u32 = BrotliGetAvailableBits(br) & 0x7;
   let mut pad_bits: u32 = 0;
@@ -354,6 +364,7 @@ pub fn BrotliPeekByte(br: &mut BrotliBitReader, mut offset: u32, input: &[u8]) -
 // Copies remaining input bytes stored in the bit reader to the output. Value
 // num may not be larger than BrotliGetRemainingBytes. The bit reader must be
 // warmed up again after this.
+#[inline]
 pub fn BrotliCopyBytes(dest: &mut [u8], br: &mut BrotliBitReader, mut num: u32, input: &[u8]) {
   let mut offset: u32 = 0;
   while BrotliGetAvailableBits(br) >= 8 && num > 0 {
@@ -377,6 +388,7 @@ pub fn BrotliInitBitReader(br: &mut BrotliBitReader) {
   br.bit_pos_ = 0;
 }
 
+#[inline]
 pub fn BrotliWarmupBitReader(br: &mut BrotliBitReader, input: &[u8]) -> bool {
   if BrotliGetAvailableBits(br) == 0 && !BrotliPullByte(br, input) {
     return false;
